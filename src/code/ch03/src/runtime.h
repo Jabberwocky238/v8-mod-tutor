@@ -32,6 +32,7 @@ class Runtime final {
 
   v8::Isolate* getIsolate() const { return isolate; }
   v8::Local<v8::Context> getContext() { return context.Get(isolate); }
+  void setEnvironment(v8::Local<v8::Object> value) { environment.Reset(isolate, value); }
   size_t activeTimerCount() const { return timers.size(); }
   size_t backgroundTaskCount() const { return executionContext.pendingTaskCount(); }
   void call(v8::Global<v8::Function>& callback);
@@ -53,6 +54,7 @@ class Runtime final {
   v8::Isolate* isolate = nullptr;
   v8::Global<v8::Context> context;
   v8::Global<v8::Object> worker;
+  v8::Global<v8::Object> environment;
   kj::Timer& timer;
   TimerQueue timers;
   ExecutionContext executionContext;

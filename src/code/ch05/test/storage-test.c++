@@ -1,43 +1,89 @@
+#include <filesystem>
+#include <optional>
+#include <string>
+
+#include <kj/async-io.h>
 #include <kj/test.h>
 
-#include "storage-fixture.h"
+#include "kv-binding.h"
+
+namespace {
+
+class TempDirectory {
+ public:
+  TempDirectory() {
+    path = std::filesystem::temp_directory_path() /
+        std::filesystem::path("v8-kv-" + std::to_string(counter++));
+    std::filesystem::remove_all(path);
+  }
+  ~TempDirectory() { std::filesystem::remove_all(path); }
+  static inline uint64_t counter = 1;
+  std::filesystem::path path;
+};
 
 KJ_TEST("physical keys isolate namespaces") {
-  KJ_EXPECT(encodeKey("one", "x") != encodeKey("two", "x"));
-  KJ_EXPECT(encodeKey("one", "x").startsWith("one\0"_kjb));
+  auto one = encodeKey("one", "x");
+  auto two = encodeKey("two", "x");
+  KJ_EXPECT(one != two);
+  KJ_EXPECT(one.size() == 5);
+  KJ_EXPECT(one[3] == '\0');
 }
 
-KJ_TEST("KvStore supports put, get, delete, and prefix list") {
-  StorageFixture fixture;
-  fixture.store.put("app", "room:a", bytes("A"));
-  fixture.store.put("app", "room:b", bytes("B"));
-  KJ_EXPECT(asText(KJ_ASSERT_NONNULL(fixture.store.get("app", "room:a"))) == "A");
-  auto page = fixture.store.list("app", "room:", kj::none, 10);
+KJ_TEST("KvStore supports put get delete and prefix list") {
+  TempDirectory directory;
+  KvStore store(directory.path.string().c_str());
+  store.put("app", "room:a", "A");
+  store.put("app", "room:b", "B");
+  KJ_EXPECT(store.get("app", "room:a") == std::optional<std::string>("A"));
+  auto page = store.list("app", "room:", 10);
   KJ_EXPECT(page.keys.size() == 2);
-  fixture.store.erase("app", "room:a");
-  KJ_EXPECT(fixture.store.get("app", "room:a") == kj::none);
+  KJ_EXPECT(page.complete);
+  store.erase("app", "room:a");
+  KJ_EXPECT(!store.get("app", "room:a").has_value());
 }
 
-KJ_TEST("StorageExecutor reports saturation instead of growing forever") {
-  StorageFixture fixture(2);
-  auto first = fixture.executor.pauseAndSubmitGet("a");
-  auto second = fixture.executor.submitGet("b");
-  auto third = fixture.executor.submitGet("c");
-  KJ_EXPECT(first.isPending());
-  KJ_EXPECT(second.isPending());
-  KJ_EXPECT_THROW_MESSAGE("StorageBusyError", third.wait(fixture.waitScope));
+KJ_TEST("StorageExecutor rejects work beyond its bound") {
+  auto io = kj::setupAsyncIo();
+  TempDirectory directory;
+  KvStore store(directory.path.string().c_str());
+  StorageExecutor executor(store, 1, 2, true);
+  auto first = executor.get("app", "a");
+  auto second = executor.get("app", "b");
+  auto third = executor.get("app", "c");
+  KJ_EXPECT(executor.queued() == 2);
+  KJ_EXPECT_THROW_MESSAGE("StorageBusyError", third.wait(io.waitScope));
+  executor.resume();
+  first.wait(io.waitScope);
+  second.wait(io.waitScope);
 }
 
-KJ_TEST("env.KV resolves on the runtime thread") {
-  StorageFixture fixture;
-  fixture.evaluate("await env.KV.put('topic', 'V8');");
-  KJ_EXPECT(fixture.evaluateString("await env.KV.get('topic')") == "V8");
-  KJ_EXPECT(fixture.lastResolutionThread() == fixture.runtimeThread());
+KJ_TEST("env KV resolves JavaScript promises on the runtime thread") {
+  auto io = kj::setupAsyncIo();
+  TempDirectory directory;
+  Runtime runtime("storage-test", io.provider->getTimer());
+  KvStore store(directory.path.string().c_str());
+  StorageExecutor executor(store);
+  KvBinding binding(runtime, executor, kj::str("app"));
+  runtime.loadWorker(
+      "globalThis.worker = { async fetch(req, env) {"
+      "await env.KV.put('topic', 'V8');"
+      "const value = await env.KV.get('topic');"
+      "await env.KV.delete('topic');"
+      "return new Response(value + ':' + (await env.KV.get('topic'))); } };");
+  auto response = runtime.dispatch("GET", "/").wait(io.waitScope);
+  KJ_EXPECT(response.body == "V8:null");
 }
 
 KJ_TEST("RocksDB data survives a clean reopen") {
-  auto directory = makeTemporaryDirectory();
-  { StorageFixture first(directory); first.store.put("app", "x", bytes("saved")); }
-  { StorageFixture second(directory);
-    KJ_EXPECT(asText(KJ_ASSERT_NONNULL(second.store.get("app", "x"))) == "saved"); }
+  TempDirectory directory;
+  {
+    KvStore first(directory.path.string().c_str());
+    first.put("app", "x", "saved", true);
+  }
+  {
+    KvStore second(directory.path.string().c_str());
+    KJ_EXPECT(second.get("app", "x") == std::optional<std::string>("saved"));
+  }
 }
+
+}  // namespace

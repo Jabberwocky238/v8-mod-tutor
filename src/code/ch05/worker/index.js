@@ -1,21 +1,8 @@
-export default {
+globalThis.worker = {
   async fetch(request, env) {
-    const url = new URL(request.url)
-    if (url.pathname !== "/api/topic") {
-      return new Response("not found", { status: 404 })
-    }
-
-    const key = `room:${url.searchParams.get("room") || "lobby"}:topic`
-    if (request.method === "PUT") {
-      await env.KV.put(key, await request.text())
-      return new Response(null, { status: 204 })
-    }
-    if (request.method === "GET") {
-      const topic = await env.KV.get(key)
-      return topic === null
-        ? new Response("not found", { status: 404 })
-        : new Response(topic)
-    }
-    return new Response("method not allowed", { status: 405 })
+    await env.KV.put("room:lobby:topic", "V8 internals")
+    const topic = await env.KV.get("room:lobby:topic")
+    const page = await env.KV.list("room:", 100)
+    return new Response(`${topic}; keys=${page.keys.length}`)
   },
 }

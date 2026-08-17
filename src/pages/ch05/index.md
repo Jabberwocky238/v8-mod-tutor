@@ -1,166 +1,203 @@
 ---
 title: 第 5 章 · 用 RocksDB 实现 env.KV
-description: 将 RocksDB 接入 KJ/V8 运行时，提供异步 get、put、delete 与 list
+description: 用锁定工具链构建 RocksDB，并实现异步 get、put、delete 与 list
 ---
 
 <p class="chapter-no">CHAPTER 05 · Storage</p>
 
 # 接入 RocksDB，做一个 KV 数据库
 
-<p class="lead">聊天室仍保留内存状态。本章新增通用持久化绑定 <code>env.KV</code>，让 worker 可以保存昵称、房间公告和计数器，而不会在 V8 线程同步等待磁盘。</p>
+<p class="lead">第四章的房间和消息仍然只在内存。本章加入 RocksDB，并向 JavaScript 提供 <code>env.KV</code>。数据库调用在工作线程执行，V8 handle 永远留在 Runtime 线程。</p>
 
-> **本章新增：`KvStore`。** 它唯一拥有 RocksDB 实例，负责 key 编码、大小限制、column family 与错误翻译。V8 binding 不直接包含 RocksDB 头文件。
+> **本章新增：`KvStore`。** 它唯一拥有 RocksDB DB，负责物理 key、大小限制、CRUD、前缀 list 和错误转换。这个类保持同步，因为 RocksDB API 本身就是同步的。
 
-> **本章新增：`StorageExecutor`。** 固定大小工作线程池执行阻塞数据库调用。输入和输出都是拥有所有权的 `kj::String` / `kj::Array<byte>`，不跨线程携带 V8 handle。
+> **本章新增：`StorageExecutor`。** 固定线程在有界队列中执行阻塞操作，使用 KJ cross-thread fulfiller 把结果送回创建 Promise 的 event loop。
 
-> **本章新增：`KvNamespace`。** 由 cppgc 管理的 JS wrapper，暴露 `get()`、`put()`、`delete()`、`list()`，每个方法返回 JavaScript Promise。
+> **本章新增：`KvBinding`。** 它把 `get()`、`put()`、`delete()`、`list()` 安装到 `env.KV`，并且只在 V8 线程创建、resolve 或 reject JavaScript Promise。
 
-<details class="code-accordion" data-code="ch05/test/storage-test.c++">
-<summary>完整测试 · ch05/test/storage-test.c++</summary>
+## 1. 用同一工具链构建 RocksDB
+
+RocksDB `v9.10.0` 的官方 Release 没有 Linux 静态库资产；系统包又使用 libstdc++，不能与本教程的 Chromium libc++ ABI 混用。因此固定 commit `ae8fb3e…`，自行构建一次静态库。
+
+压缩库、jemalloc、gflags、benchmark 和命令行工具都不是 KV 教学所需，全部关闭。这既避免系统动态依赖，也缩小需要理解的依赖面。
+
+<details class="code-accordion" data-code="ch05/install-rocksdb.sh">
+<summary>完整文件 · ch05/install-rocksdb.sh</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-## 1. 安装与链接
-
-Ubuntu / Debian：
-
 ```bash
-sudo apt install -y librocksdb-dev
-pkg-config --modversion rocksdb
+export LAB_ROOT=/home/zq/v8v8
+bash "$LAB_ROOT/v8-mod-tutor/src/code/ch05/install-rocksdb.sh"
 ```
 
-在 CMake 中使用 `pkg_check_modules(ROCKSDB REQUIRED rocksdb)`，并把 include、library 和 compiler flags 只挂到 storage target。
-
-## 2. 数据模型
-
-打开 `data/kv`，创建两个 column family：
-
-| Column family | 内容 |
-| --- | --- |
-| `default` | 元数据与 schema version |
-| `kv` | 用户 key/value |
-
-实际 key 编码为 `<namespace>\0<user-key>`。这样以后可以为不同 worker 创建逻辑 namespace，而不需要为每个 namespace 建 column family。
-
-限制必须在排队前检查：key 不超过 1 KiB，value 不超过 1 MiB，list limit 为 1–1000。拒绝含 NUL 的 namespace，避免前缀边界模糊。
-
-<div class="test-result"><strong>步骤测试 5.1 · Key 编码</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R storage</code></dd>
-<dt>预期输出</dt><dd><code>physical keys isolate namespaces ... PASS</code>。</dd>
-<dt>原因</dt><dd>相同用户 key 在不同 namespace 下生成不同物理 key，NUL 分隔符提供明确前缀边界。</dd>
+<div class="test-result"><strong>步骤测试 5.1 · RocksDB 静态构建</strong><dl>
+<dt>预期输出</dt><dd>完成 344 个对象后出现 <code>Linking CXX static library librocksdb.a</code>，脚本末行是 <code>RocksDB 9.10.0:OK</code>。</dd>
+<dt>原因</dt><dd>安装结果来自锁定 Clang 21/libc++，不是系统 <code>librocksdb-dev</code>；所有可选压缩库均关闭。</dd>
 </dl></div>
 
-## 3. C++ 存储接口
+## 2. 建立 Chapter 05 工程
+
+本章复用第三章 Runtime，并链接刚安装的 `RocksDB::rocksdb` CMake target。
+
+<details class="code-accordion" data-code="ch05/CMakeLists.txt">
+<summary>完整文件 · ch05/CMakeLists.txt</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+```bash
+CMAKE="$LAB_ROOT/.deps/cmake-3.31.8/bin/cmake"
+SOURCE="$LAB_ROOT/v8-mod-tutor/src/code/ch05"
+BUILD="$SOURCE/build-v137"
+
+"$CMAKE" -S "$SOURCE" -B "$BUILD" -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE="$LAB_ROOT/v8-mod-tutor/toolchain/v8-pinned.cmake" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$LAB_ROOT/.deps/v137"
+"$CMAKE" --build "$BUILD"
+```
+
+<div class="test-result"><strong>步骤测试 5.2 · 链接存储运行时</strong><dl>
+<dt>预期输出</dt><dd>最后链接 <code>libstorage_runtime.a</code>、<code>storage-test</code> 和 <code>v8-kv</code>。</dd>
+<dt>原因</dt><dd>V8、KJ、RocksDB 和 storage binding 已在同一套 libc++ ABI 下组成可执行程序。</dd>
+</dl></div>
+
+## 3. 先定义物理 key
+
+逻辑 namespace 和用户 key 编码为：
+
+```text
+<namespace> \0 <user-key>
+```
+
+NUL 是明确边界，所以 `one/x` 与 `two/x` 永远不会碰撞。namespace 最长 128 字节且不能含 NUL，key 最长 1 KiB，value 最长 1 MiB。
 
 <details class="code-accordion" data-code="ch05/src/kv-store.h">
 <summary>完整文件 · ch05/src/kv-store.h</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-`KvStore` 方法是同步的，因为 RocksDB API 本身同步；异步边界放在调用者 `StorageExecutor`，而不是伪装成内部 Promise。
+<details class="code-accordion" data-code="ch05/src/kv-store.c++">
+<summary>完整文件 · ch05/src/kv-store.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-<div class="test-result"><strong>步骤测试 5.2 · KV 基本语义</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R storage</code></dd>
-<dt>预期输出</dt><dd><code>KvStore supports put, get, delete, and prefix list ... PASS</code>。</dd>
-<dt>原因</dt><dd>两个前缀 key 可被同一 snapshot iterator 找到，删除后 Get 正确映射为 `kj::none`。</dd>
+KvStore 的 `get` 用 `std::optional` 区分“不存在”和空字符串；list 从编码后的 prefix Seek，离开前缀后立即停止。单次写默认启用 WAL，但 `sync=false`；需要强制刷盘时显式传 `true`。
+
+<div class="test-result"><strong>步骤测试 5.3 · 编码与 CRUD/list</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] physical keys isolate namespaces</code> 和 <code>[PASS] KvStore supports put get delete and prefix list</code>。</dd>
+<dt>原因</dt><dd>第一个 case 检查 NUL 的准确位置；第二个写入两个前缀 key、读取、列举、删除，再确认 deleted key 返回空 optional。</dd>
 </dl></div>
 
-## 4. 工作线程与 KJ 回传
+## 4. 建立有界工作队列
+
+同步 RocksDB 调用不能直接放在 V8/KJ 线程，否则一次磁盘抖动会同时冻结 HTTP、timer 和 WebSocket。StorageExecutor 的队列只保存拥有所有权的字符串与回调：
 
 ```text
-V8/KJ thread                          storage worker
--------------                        --------------
-env.KV.get("x")
-  创建 JS Promise
-  复制 namespace/key  ─────────────→ RocksDB::Get
-                                      复制结果
-  KJ event port 唤醒 ←─────────────  完成消息入队
-  进入 isolate
-  resolve/reject
-  microtask checkpoint
+V8 / KJ thread                    storage thread
+--------------                   --------------
+创建 KJ Promise
+复制 key/value ────────────────→ RocksDB::Get/Put
+                                 复制结果
+cross-thread fulfiller ─────────→ 唤醒原 event loop
+进入 Isolate
+resolve JavaScript Promise
 ```
 
-> **硬规则：V8 handle 不跨线程。** `v8::Local`、`v8::Global`、Context、Isolate 和 cppgc 对象都不进入 storage worker。worker 只处理字节；resolve Promise 的动作永远回到 Runtime 线程。
+<details class="code-accordion" data-code="ch05/src/storage-executor.h">
+<summary>完整文件 · ch05/src/storage-executor.h</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-使用有界队列，例如 1024 个操作。队列满时立即 reject 为 `StorageBusyError`，而不是无限积压并耗尽内存。
+<details class="code-accordion" data-code="ch05/src/storage-executor.c++">
+<summary>完整文件 · ch05/src/storage-executor.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-<div class="test-result"><strong>步骤测试 5.3 · 工作队列压力</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R storage</code></dd>
-<dt>预期输出</dt><dd><code>StorageExecutor reports saturation ... PASS</code>。</dd>
-<dt>原因</dt><dd>容量为 2 的测试队列已被占满，第三项立即得到 StorageBusyError，没有增长为第三个 pending job。</dd>
+> **线程硬规则。** worker lambda 只能携带字符串、数字和 CrossThreadPromiseFulfiller。`v8::Local`、`v8::Global`、Context、Isolate 与 cppgc 对象都不能进入 RocksDB 线程。
+
+<div class="test-result"><strong>步骤测试 5.4 · 饱和时立即拒绝</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] StorageExecutor rejects work beyond its bound</code>。</dd>
+<dt>原因</dt><dd>测试暂停单个 worker，以容量 2 提交三项；前两项留在队列，第三项立即以 <code>StorageBusyError</code> reject，随后恢复 worker 并正常 drain。</dd>
 </dl></div>
 
-## 5. JS API
+## 5. 安装 env.KV
+
+第三章 Runtime 增加一个可选 environment Global；没有 binding 时仍传空对象，有 KvBinding 时传入包含 KV 的同一个 env。
+
+KvBinding 自身由 C++ Runtime 生命周期持有，JS 方法的 `v8::External` 只保存它的非拥有指针。关闭顺序固定为：先销毁 binding TaskSet，再停止并 join StorageExecutor，随后关闭 RocksDB，最后才销毁 Runtime/Isolate。
+
+<details class="code-accordion" data-code="ch05/src/kv-binding.h">
+<summary>完整文件 · ch05/src/kv-binding.h</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+<details class="code-accordion" data-code="ch05/src/kv-binding.c++">
+<summary>完整文件 · ch05/src/kv-binding.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+JavaScript API 保持最小：
 
 ```js
 await env.KV.put("room:lobby:topic", "V8 internals")
 const topic = await env.KV.get("room:lobby:topic")
+const page = await env.KV.list("room:", 100)
 await env.KV.delete("room:lobby:topic")
-
-const page = await env.KV.list({ prefix: "room:lobby:", limit: 100 })
-// { keys: ["room:lobby:topic"], cursor: null, complete: true }
 ```
 
-本教程默认 UTF-8 字符串值。binding 内部仍以 bytes 保存，为以后增加 `arrayBuffer` 类型留下空间。
+`get` 缺失时 resolve 为 `null`；list 返回 `{ keys, complete }`。本章不加入 cursor，避免在还没有分页需求时伪造不稳定协议。
 
-<div class="test-result"><strong>步骤测试 5.4 · JS Promise 回传</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R storage</code></dd>
-<dt>预期输出</dt><dd><code>env.KV resolves on the runtime thread ... PASS</code>。</dd>
-<dt>原因</dt><dd>RocksDB worker 只返回 bytes；KJ event port 唤醒 Runtime 线程后才 resolve JS Promise。</dd>
+<div class="test-result"><strong>步骤测试 5.5 · JavaScript Promise 回传</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] env KV resolves JavaScript promises on the runtime thread</code>。</dd>
+<dt>原因</dt><dd>worker 依次 await put、get、delete、get，最终 Response 是 <code>V8:null</code>。V8 对象只在 KJ continuation 回到 Runtime 后创建。</dd>
 </dl></div>
 
-## 6. cppgc wrapper
+## 6. 完整程序与示例 worker
 
-`KvNamespace` 不拥有数据库，只保存生命周期受 Runtime 保证的 executor 指针与 namespace：
-
-```cpp
-class KvNamespace final : public v8::Object::Wrappable {
- public:
-  KvNamespace(StorageExecutor& executor, kj::String name)
-      : executor(executor), name(kj::mv(name)) {}
-
-  void Trace(cppgc::Visitor* visitor) const override {
-    v8::Object::Wrappable::Trace(visitor);
-  }
-
- private:
-  StorageExecutor& executor;
-  kj::String name;
-};
-```
-
-Runtime 关闭时先拒绝新请求，再 drain 或取消 storage queue，最后才能销毁 RocksDB、cppgc heap 和 Isolate。
-
-## 7. 在聊天室中使用
-
-保留 `ChatHub` 内存模型，只将房间 topic 持久化：
+<details class="code-accordion" data-code="ch05/src/main.c++">
+<summary>完整文件 · ch05/src/main.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
 <details class="code-accordion" data-code="ch05/worker/index.js">
 <summary>完整文件 · ch05/worker/index.js</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-## 8. 一致性与崩溃语义
+完整测试文件：
 
-- 单个 `put`/`delete` 是原子的。
-- 本章默认 WAL 开启；Promise fulfilled 表示写入已进入 RocksDB WAL，不等于磁盘介质已 `fsync`。
-- 需要强持久性时为该写入设置 `sync=true`，代价留到第六章测量。
-- `list` 使用 RocksDB snapshot，保证同一页迭代期间视图稳定；跨页不承诺事务快照。
+<details class="code-accordion" data-code="ch05/test/storage-test.c++">
+<summary>完整文件 · ch05/test/storage-test.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-完整选项与 key schema 见[存储参考](../reference/storage/)。
+```bash
+"$BUILD/storage-test"
+"$LAB_ROOT/.deps/cmake-3.31.8/bin/ctest" --test-dir "$BUILD" --output-on-failure
+```
 
-<div class="test-result"><strong>步骤测试 5.5 · 重启恢复</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R storage</code></dd>
-<dt>预期输出</dt><dd><code>RocksDB data survives a clean reopen ... PASS</code>。</dd>
-<dt>原因</dt><dd>第一个 DB 实例关闭后，第二个实例从同一临时目录读取 WAL/SST，得到先前写入的 `saved`。</dd>
+<div class="test-result"><strong>步骤测试 5.6 · 五个存储 case</strong><dl>
+<dt>预期输出</dt><dd>五行 <code>[PASS]</code>，汇总 <code>5 test(s) passed</code>；CTest 为 <code>1/1 ... Passed</code>。</dd>
+<dt>原因</dt><dd>KJ runner 分别覆盖编码、同步数据库、跨线程背压、JS binding 和重开恢复；CTest 将整个 runner 视为一个测试程序。</dd>
 </dl></div>
 
-## 9. 验收
+## 7. 重开验收
 
-1. `put → get → delete → get` 返回预期值。
-2. 重启进程后 topic 仍存在。
-3. 并发写同一 key 不崩溃，最后值属于某个已成功操作。
-4. 非法大 key/value 在 V8 线程立即 reject，不进入工作队列。
-5. 压满存储队列时返回明确错误，HTTP 服务与 WebSocket 心跳仍响应。
+选择一个不会与现有数据库冲突的新目录，连续运行两次：
+
+```bash
+DB=/tmp/v8-kv-ch05
+mkdir -p "$DB"
+"$BUILD/v8-kv" "$SOURCE/worker/index.js" "$DB"
+"$BUILD/v8-kv" "$SOURCE/worker/index.js" "$DB"
+```
+
+<div class="test-result"><strong>章节验收 · 持久化 KV</strong><dl>
+<dt>预期输出</dt><dd>两次都输出 <code>V8 internals; keys=1</code>。</dd>
+<dt>原因</dt><dd>第一次创建 DB 并写入 topic，第二次打开同一目录后覆盖同一 key；前缀 list 始终只看见一个持久化物理 key。</dd>
+</dl></div>
+
+当前逐项写 WAL、日志逐条 flush 的策略优先保证清晰和可靠。下一章会加入 trace 与负载测试，用数据决定怎样批量写入，而不是先猜优化参数。
 
 <nav class="pager"><a href="../ch04/">← 第 4 章</a><a href="../ch06/">第 6 章：Trace 与优化 →</a></nav>

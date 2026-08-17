@@ -71,6 +71,7 @@ Runtime::Runtime(const char* executablePath, kj::Timer& timer)
 Runtime::~Runtime() noexcept {
   timers.clear();
   executionContext.clear();
+  environment.Reset();
   worker.Reset();
   context.Reset();
   isolate->Dispose();
@@ -203,7 +204,8 @@ kj::Promise<FetchResponse> Runtime::dispatch(kj::StringPtr method, kj::StringPtr
   KJ_REQUIRE(localWorker->Get(ctx, jsString(isolate, "fetch")).ToLocal(&fetchValue) &&
                  fetchValue->IsFunction(),
              "worker.fetch must be a function");
-  v8::Local<v8::Value> args[] = {request, v8::Object::New(isolate), execution};
+  auto env = environment.IsEmpty() ? v8::Object::New(isolate) : environment.Get(isolate);
+  v8::Local<v8::Value> args[] = {request, env, execution};
   v8::Local<v8::Value> result;
   if (!fetchValue.As<v8::Function>()->Call(ctx, localWorker, 3, args).ToLocal(&result)) {
     throw jsError(caught, "fetch failed");
