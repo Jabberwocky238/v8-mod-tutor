@@ -1,0 +1,41 @@
+/*
+ * print settings
+ *
+ * include this file in `global.css` via `@include "./print.css"` if you need some basic print styles
+ */
+@media print {
+  :root {
+    font-size: 11pt;
+  }
+
+  aside,
+  section {
+    break-inside: avoid-page;
+  }
+  h2:has(+ section) {
+    break-after: avoid-page;
+  }
+
+  h1:first-child {
+    margin-top: 0;
+  }
+
+  p {
+    break-inside: auto;
+  }
+  html {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    margin: 0 auto;
+  }
+  body {
+    margin: 0;
+  }
+}
+@page {
+  margin: 0.5in;
+}
+
+@page :first {
+  /* margin-top: 2in; */
+}

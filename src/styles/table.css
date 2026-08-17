@@ -1,0 +1,25 @@
+/*
+ * table settings
+ *
+ * include this file in `global.css` via `@include "./table.css"` if you need some basic table styles
+ */
+table {
+  display: block;
+  margin: 0 1rem;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+thead {
+  background-color: var(--colors-light-dark);
+  color: var(--colors-light);
+}
+
+tr:nth-child(2n) {
+  background-color: var(--colors-dark-light);
+}
+
+th,
+td {
+  padding: 0 1rem;
+}

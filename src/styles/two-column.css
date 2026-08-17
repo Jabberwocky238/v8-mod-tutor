@@ -1,0 +1,60 @@
+/*
+ * class for a two-column layout on large screens & when printed
+ *
+ * include this file in `global.css` via `@include "./two-column.css"` if you
+ * want this
+ *
+ * requires setting the --env-layout-screen-medium variable via postcss by
+ * including the following in your vite.config.(j|t)s
+ *
+ * ```
+ * import postcssEnvFunction from "postcss-env-function"
+ *
+ * // ...
+ *
+ * export default {
+ *   // ...
+ *   css: {
+ *     postcss: {
+ *       map: true,
+ *       plugins: [
+ *         postcssEnvFunction({
+ *           importFrom: [{
+ *             environmentVariables: {
+ *               "--layout-screen-small": "44rem",
+ *               "--layout-screen-medium": "60rem",
+ *             },
+ *           }],
+ *         }),
+ *       ],
+ *     },
+ *   },
+ *   // ...
+ * } satisfies UserConfig
+ * ```
+
+ */
+
+@media print, screen and (min-width: env(--env-layout-screen-medium)) {
+  .two-column-container,
+  section > section > div {
+    display: grid;
+    grid-template-columns: 1fr 1fr; /* customize column widths here */
+    gap: var(--layout-grid-gap);
+  }
+  .two-column-column > *:first-child,
+  section > section > div > div > *:first-child {
+    margin-top: 0;
+    padding-top: 0;
+  }
+  .two-column > *:last-child,
+  section > section > div > div > *:last-child {
+    margin-bottom: 0;
+    padding-bottom: 0;
+  }
+  /* restore left padding of lists inside this layout */
+  .two-column ul,
+  .two-column ol {
+    padding-left: 1rem;
+  }
+}
