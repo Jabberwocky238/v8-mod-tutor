@@ -80,16 +80,16 @@ a { color: var(--green-dark); text-underline-offset: 3px; }
 }
 
 .brand { font: 700 14px/1 "Cascadia Code", monospace; text-decoration: none; color: var(--ink); }
-.site-header nav { display: flex; gap: 22px; overflow-x: auto; white-space: nowrap; margin-left: auto; }
+.site-header nav { display: flex; min-width: 0; gap: 22px; overflow-x: auto; white-space: nowrap; margin-left: auto; }
 .site-header nav a { font-size: 13px; color: var(--muted); text-decoration: none; }
 .site-header nav a:hover { color: var(--green); }
 
-.theme-switcher { display: grid; grid-template-columns: repeat(3, 30px); flex: 0 0 auto; border: 1px solid var(--line); }
-.theme-switcher button { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border: 0; border-right: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
+.theme-switcher { display: grid; grid-template-columns: repeat(3, 36px); flex: 0 0 auto; border: 1px solid var(--ink); }
+.theme-switcher button { width: 36px; height: 34px; display: grid; place-items: center; padding: 0; border: 0; border-right: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
 .theme-switcher button:last-child { border-right: 0; }
 .theme-switcher button:hover { color: var(--ink); background: var(--inline-code); }
 .theme-switcher button[aria-pressed="true"] { color: var(--paper); background: var(--ink); }
-.theme-switcher svg { width: 15px; height: 15px; }
+.theme-switcher svg { display: block; width: 17px; height: 17px; }
 
 main { width: min(100% - 40px, 820px); margin: 0 auto; }
 article { padding: 72px 0 96px; }

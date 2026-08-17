@@ -7,7 +7,7 @@ import css from "highlight.js/lib/languages/css"
 import javascript from "highlight.js/lib/languages/javascript"
 import json from "highlight.js/lib/languages/json"
 import xml from "highlight.js/lib/languages/xml"
-import { Check, Copy, createIcons, Moon, Settings, Sun } from "lucide"
+import { Check, Copy, createIcons } from "lucide"
 
 type Theme = "light" | "dark" | "system"
 
@@ -30,7 +30,6 @@ for (const button of themeButtons) {
 
 const initialTheme = document.documentElement.dataset.theme as Theme | undefined
 setTheme(initialTheme ?? "system")
-createIcons({ icons: { Moon, Settings, Sun } })
 
 hljs.registerLanguage("bash", bash)
 hljs.registerLanguage("cmake", cmake)
@@ -80,7 +79,7 @@ for (const details of document.querySelectorAll<HTMLDetailsElement>(
   const setCopyState = (copied: boolean) => {
     button.innerHTML = `<i data-lucide="${copied ? "check" : "copy"}"></i>`
     button.setAttribute("aria-label", copied ? "已复制" : "复制完整代码")
-    createIcons({ icons: { Check, Copy, Moon, Settings, Sun } })
+    createIcons({ icons: { Check, Copy } })
   }
 
   code.innerHTML = hljs.highlight(source, { language: languageFor(path) }).value
