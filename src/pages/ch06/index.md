@@ -1,178 +1,169 @@
 ---
-title: 第 6 章 · Trace、压测与写入优化
-description: 跟踪请求和存储阶段，建立性能基线，并用 RocksDB WriteBatch 优化写入吞吐
+title: 第 6 章 · Trace、测量与批量写
+description: 用有界 Trace 记录性能，再用 RocksDB WriteBatch 减少物理写调用
 ---
 
 <p class="chapter-no">CHAPTER 06 · Trace</p>
 
-# 用 Trace 找到写入瓶颈
+# 先看见瓶颈，再优化写入
 
-<p class="lead">最后一章不再增加产品功能。我们给已有请求建立时间线，区分排队、JavaScript、定时器、RocksDB 和日志开销，再根据数据优化写入路径。</p>
+<p class="lead">上一章已经能持久化 KV，但“能够写入”和“知道写得怎么样”是两回事。本章先记录一段工作的父子关系和耗时，再把许多小写入合成 RocksDB WriteBatch，最后用同一个可执行 benchmark 比较两条路径。</p>
 
-> **本章新增：`TraceContext`。** 每个请求生成 trace id，维护单调时钟时间线；异步任务显式携带上下文，不能依赖线程局部变量，因为 continuation 可能稍后运行。
+> **本章新增：`TraceContext` 与 `Span`。** 一个 context 表示一条 trace；每个 RAII span 记录名称、父 span、单调时钟开始时间、耗时和状态。作用域异常退出时，析构函数仍会补一条 `unset` 记录。
 
-> **本章新增：`Span`。** RAII 对象记录开始、结束、状态和少量属性。析构只提交内存记录，不做磁盘 I/O。
+> **本章新增：`TraceWriter`。** 业务线程只把记录放进有界内存队列，后台线程分批追加 JSONL。队列满时增加 `dropped` 并立即返回，磁盘变慢不会无限占用内存。
 
-> **本章新增：`TraceWriter`。** 有界队列加单 writer，将 span 批量写入 `data/traces.jsonl`。队列满时丢弃并累计 dropped 指标，不能反向拖慢业务路径。
+> **本章新增：`WriteOperation` 与 `KvStore::writeBatch()`。** 一组 put/delete 由一个 RocksDB `WriteBatch` 原子提交，继续沿用第五章的 namespace、key 和 value 限制。
 
-> **本章新增：`WriteCoordinator`。** 在很短的批处理窗口内合并独立 KV 写入，使用 RocksDB `WriteBatch` 一次提交并分别完成原始 Promise。
+> **本章新增：`WriteCoordinator`。** 它按操作数或字节数形成批次，并公开 `operations`、`writeCalls` 两个计数器，让优化可以被测试，而不是靠感觉判断。
 
-<details class="code-accordion" data-code="ch06/test/trace-test.c++">
-<summary>完整测试 · ch06/test/trace-test.c++</summary>
+> **本章新增：`write-benchmark`。** 它对两个新数据库写入完全相同的 10,000 个 1 KiB value，分别测逐条 put 和每 128 条一批。它是独立程序，不依赖不存在的 HTTP API 或外部压测工具。
+
+## 1. 建立本章工程
+
+本章只需要第五章的 `KvStore`、锁定版本的 KJ 和 RocksDB。`Trace` 本身不接触 V8 handle；以后把 span 放进请求、定时器或存储 continuation 时，仍需遵守“V8 handle 不跨线程”的规则。
+
+<details class="code-accordion" data-code="ch06/CMakeLists.txt">
+<summary>完整文件 · ch06/CMakeLists.txt</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-## 1. Span 模型
+```bash
+export LAB_ROOT=/home/zq/v8v8
+CMAKE="$LAB_ROOT/.deps/cmake-3.31.8/bin/cmake"
+SOURCE="$LAB_ROOT/v8-mod-tutor/src/code/ch06"
+BUILD="$SOURCE/build-v137"
 
-一次第 3 章的请求至少产生：
-
-```text
-http.request                 0ms ───────────────────────── 3004ms
-  js.fetch                   1ms ──────────────────────── 3002ms
-    timer.wait               2ms ───────────────────── 3001ms
-  http.write                                              2ms
-waitUntil.background                                     ─── 252ms
+"$CMAKE" -S "$SOURCE" -B "$BUILD" -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE="$LAB_ROOT/v8-mod-tutor/toolchain/v8-pinned.cmake" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$LAB_ROOT/.deps/v137"
+"$CMAKE" --build "$BUILD"
 ```
 
-KV 请求再增加：
+<div class="test-result"><strong>步骤测试 6.1 · 构建独立工程</strong><dl>
+<dt>预期输出</dt><dd>最后出现 <code>Linking CXX executable trace-test</code> 和 <code>Linking CXX executable write-benchmark</code>。</dd>
+<dt>原因</dt><dd>两个程序都由锁定的 Clang 21、libc++、KJ 与 RocksDB 静态库完成链接，本章代码没有退回系统 C++ 依赖。</dd>
+</dl></div>
 
-```text
-kv.operation
-  storage.queue
-  rocksdb.get / rocksdb.write
-```
+## 2. 定义 Trace 数据模型
 
-分别记录 queue time 和 service time。只看总耗时无法判断是 RocksDB 慢，还是线程池排队。
-
-## 2. RAII Span
+Trace ID 标识整条工作链；span ID 标识其中一步；`parentSpanId` 把步骤连成树。时间使用 `steady_clock`，因为系统时间被校准或手工修改时，单调时钟仍能正确计算耗时。
 
 <details class="code-accordion" data-code="ch06/src/trace.h">
 <summary>完整文件 · ch06/src/trace.h</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-显式 `finish()` 和析构兜底都必须幂等。异常路径同样写 span，但只记录错误类别，不把聊天文本、KV value 或完整 URL query 写进 trace。
+`TraceContext::span(name, parentId)` 创建 span。根 span 的 parent 是 0；子 span 显式接收父 ID。显式传递比线程局部变量更适合异步 Runtime，因为 continuation 不一定立刻执行。
 
-<div class="test-result"><strong>步骤测试 6.1 · Span 父子关系与耗时</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R trace</code></dd>
-<dt>预期输出</dt><dd><code>nested spans preserve... PASS</code> 与 <code>span duration uses... PASS</code>。</dd>
-<dt>原因</dt><dd>child 继承 traceId 并记录 parentSpanId；fake monotonic clock 前进 30ms，所以 duration 精确为 30ms。</dd>
+## 3. 用 RAII 收尾 Span
+
+<details class="code-accordion" data-code="ch06/src/trace.c++">
+<summary>完整文件 · ch06/src/trace.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+`finish()` 先检查 `finished`，所以显式结束后，析构不会重复提交。测试注入一个返回整数纳秒的时钟，避免真的等待 30 ms：时钟从 1,000 前进到 30,001,000，记录必须恰好是 30,000,000 ns。
+
+<div class="test-result"><strong>步骤测试 6.2 · 父子关系、耗时与析构兜底</strong><dl>
+<dt>运行</dt><dd><code>"$BUILD/trace-test"</code></dd>
+<dt>预期输出</dt><dd><code>[PASS] nested spans preserve trace and parent identifiers</code>、<code>[PASS] span duration uses a monotonic clock and finish is idempotent</code>、<code>[PASS] span destructor records an unfinished scope</code>。</dd>
+<dt>原因</dt><dd>父子 span 共享 trace ID，child 的 parent 是 root；注入时钟让耗时完全确定；离开作用域而未调用 finish 时，析构提交状态为 unset 的记录。</dd>
 </dl></div>
 
-## 3. 上下文传播
+## 4. 有界队列与 JSONL
 
-HTTP 入口创建根 trace：
+`submit()` 只持锁移动一个 `TraceRecord`，不打开文件。后台 writer 从队列取最多 `batchSize` 条，再一次打开并追加文件。关闭时先唤醒并 join 线程，最后 drain 剩余记录。
 
-```cpp
-auto trace = TraceContext::start(random, timer);
-auto span = trace.span("http.request");
-return runtime.dispatch(kj::mv(trace), ...)
-    .attach(kj::mv(span));
+每行是一条完整 JSON，对进程崩溃后的局部恢复和流式分析都更友好：
+
+```json
+{"trace_id":"...","span_id":2,"parent_span_id":1,"name":"rocksdb.write","started_ns":1000,"duration_ns":30000000,"status":"ok"}
 ```
 
-定时器、waitUntil、WebSocket 消息和 storage job 都显式复制轻量 `TraceToken`。后台线程只记录整数时间戳和已脱敏属性，最后交给 writer。
+测试把后台线程关闭，容量设为 2，确保第三次 submit 稳定失败。另一个测试主动 flush 两条记录，检查换行转义和提交顺序。
 
-## 4. 建立基线
-
-不要先改 RocksDB 选项。使用固定机器、固定 value 大小和固定并发，分别测：
-
-```bash
-# 纯 HTTP/JS，不访问 KV
-wrk -t4 -c64 -d30s http://127.0.0.1:8080/api/ping
-
-# 每请求一次 1 KiB put
-wrk -t4 -c64 -d30s -s runtime/test/put.lua http://127.0.0.1:8080/api/kv
-```
-
-收集吞吐、错误率、p50/p95/p99、storage queue p95、RocksDB write p95、trace dropped 数和进程 RSS。每组先预热 10 秒，至少重复三次。
-
-> **压测边界。** 第 3 章故意等待 3 秒的示例不能用于吞吐基线；为压测单独提供无 timer 的 `/api/ping` 和 `/api/kv`。否则测到的是教学延迟，不是运行时能力。
-
-## 5. 先优化 trace 写入
-
-错误做法是在每个 span 结束时 `write()` + `fsync()`。正确路径：
-
-1. 业务线程把定长 `TraceRecord` 放进有界队列。
-2. writer 最多等待 10ms 或累计 256 条。
-3. 一次序列化成连续 buffer，执行一次 append。
-4. 每秒 flush；崩溃最多丢失这一秒 trace，业务数据不受影响。
-
-测量开启 trace 前后 `/api/ping` 吞吐。默认采样率先设 10%，错误请求始终采样。
-
-<div class="test-result"><strong>步骤测试 6.2 · Trace 队列有界</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R trace</code></dd>
-<dt>预期输出</dt><dd><code>TraceWriter drops at capacity... PASS</code>，queue depth 为 2，dropped 为 1。</dd>
-<dt>原因</dt><dd>writer 被暂停且容量只有 2，第三条记录按策略丢弃，提交线程没有等待磁盘。</dd>
+<div class="test-result"><strong>步骤测试 6.3 · 队列上限与 JSONL</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] TraceWriter drops at capacity without blocking the caller</code> 和 <code>[PASS] TraceWriter writes escaped JSONL records in submission order</code>。</dd>
+<dt>原因</dt><dd>暂停消费后容量只有 2，第三条使 dropped 变成 1；flush 后文件恰有两行，名称中的换行被写成 <code>\n</code>，第二行仍是 span 2。</dd>
 </dl></div>
 
-## 6. 用 WriteBatch 合并 KV 写入
+## 5. 给 KvStore 增加原子批次
 
-`WriteCoordinator` 的批处理条件：最多等待 1ms、最多 128 个操作、最多 1 MiB。任何条件满足就提交：
+<details class="code-accordion" data-code="ch05/src/kv-store.h">
+<summary>完整文件 · ch05/src/kv-store.h</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+<details class="code-accordion" data-code="ch05/src/kv-store.c++">
+<summary>完整文件 · ch05/src/kv-store.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+每个操作仍先经过 `encodeKey()` 和大小检查，再进入 `rocksdb::WriteBatch`。`DB::Write()` 只调用一次；失败时整个 batch 失败，不会向其中某一项假报成功。默认仍保留 WAL 且 `sync=false`，持久性语义与上一章一致。
+
+## 6. 按阈值形成批次
 
 <details class="code-accordion" data-code="ch06/src/write-coordinator.h">
 <summary>完整文件 · ch06/src/write-coordinator.h</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-```cpp
-rocksdb::WriteBatch batch;
-for (auto& op : pending) {
-  if (op.isPut()) batch.Put(kvHandle, op.key(), op.value());
-  else batch.Delete(kvHandle, op.key());
-}
-auto status = db.Write(writeOptions, &batch);
-completeAll(pending, status);
+<details class="code-accordion" data-code="ch06/src/write-coordinator.c++">
+<summary>完整文件 · ch06/src/write-coordinator.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+默认上限是 128 个操作或 1 MiB。达到任一阈值就 flush；一轮工作结束也必须显式 flush，析构只作为异常路径兜底。真实服务中仍把 coordinator 放到第五章的存储工作线程，不要在 V8/KJ event loop 上执行 RocksDB 写入。
+
+<div class="test-result"><strong>步骤测试 6.4 · 阈值、读取与重启恢复</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] WriteCoordinator flushes at the operation threshold</code> 和 <code>[PASS] batched data and deletes survive reopening RocksDB</code>。</dd>
+<dt>原因</dt><dd>前两个 put 不写数据库，第三个使 writeCalls 从 0 变成 1；另一个 case 用一个 batch 完成 put 与 delete，关闭并重开 RocksDB 后，新值仍在、旧值已删除。</dd>
+</dl></div>
+
+## 7. 测量，而不是猜测
+
+<details class="code-accordion" data-code="ch06/src/write-benchmark.c++">
+<summary>完整文件 · ch06/src/write-benchmark.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+```bash
+"$BUILD/write-benchmark" 10000
 ```
 
-一次 WriteBatch 原子提交。批内某个操作格式错误必须在入队前拒绝；进入 batch 后只能整体成功或整体失败。
-
-<div class="test-result"><strong>步骤测试 6.3 · 批量阈值</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R trace</code></dd>
-<dt>预期输出</dt><dd><code>WriteCoordinator flushes at the operation threshold ... PASS</code>。</dd>
-<dt>原因</dt><dd>前两个 put 未达阈值，write call 为 0；第三个加入后形成一次 WriteBatch，三个原 Promise 一起 fulfilled。</dd>
-</dl></div>
-
-## 7. WAL 与 sync 的取舍
-
-比较三组，而不是直接关闭安全选项：
-
-| 模式 | 语义 | 预期代价 |
-| --- | --- | --- |
-| WAL on, `sync=false` | 默认，进程崩溃可恢复；断电有窗口 | 常规 |
-| WAL on, `sync=true` | 每批强制落盘 | 延迟最高 |
-| WAL off | 依赖 memtable/SST，崩溃可能丢数据 | 仅可重建数据 |
-
-聊天室 topic 属于用户数据，默认保留 WAL。trace 本身允许有限丢失，应走独立追加日志，不要与 KV 的持久性策略捆绑。
-
-<div class="test-result"><strong>步骤测试 6.4 · 批量失败传播</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R trace</code></dd>
-<dt>预期输出</dt><dd><code>a failed WriteBatch rejects every member ... PASS</code>。</dd>
-<dt>原因</dt><dd>WriteBatch 是整体提交；模拟 disk full 后，批内两个 Promise 都收到同一失败，没有一项假报成功。</dd>
-</dl></div>
-
-## 8. 验证优化有效
-
-最终报告至少包含：
+本仓库在 2026-08-17 的一次 Debug 构建实测为：
 
 ```text
-metric                 before       after
-write requests/s       ...          ...
-http p99               ... ms       ... ms
-storage queue p95      ... ms       ... ms
-rocksdb write p95      ... ms       ... ms
-trace dropped          ...          ...
+mode=individual operations=10000 write_calls=10000 elapsed_ms=27
+mode=batch128 operations=10000 write_calls=79 elapsed_ms=15
 ```
 
-只有在错误率不升、内存有界、持久性语义不变时，吞吐提升才算成立。若 p50 变好但 p99 因 1ms 聚合窗口恶化，需要减小窗口或只在队列有压力时批处理。
+79 等于 `ceil(10000 / 128)`，这是不受机器速度影响的结构性结果。27 ms 和 15 ms 会受 CPU、文件系统、后台负载及 Debug/Release 构建影响，不能写进单元测试，也不能承诺为固定加速比。正式比较应使用 Release 构建，多轮预热并报告中位数与尾延迟。
 
-完整字段、采样和关闭顺序见[Trace 参考](../reference/trace/)。
+<div class="test-result"><strong>步骤测试 6.5 · 真实批量写基线</strong><dl>
+<dt>预期输出</dt><dd>第一行 <code>write_calls=10000</code>，第二行 <code>write_calls=79</code>；两行的 <code>operations</code> 都是 10000。</dd>
+<dt>原因</dt><dd>两组写入数据量相同，差别只在提交方式。最后不足 128 条的 16 个操作由显式 flush 形成第 79 次写。</dd>
+</dl></div>
 
-## 9. 最终验收
+## 8. 一次运行全部验证
 
-- HTTP、3 秒 timer、waitUntil、SPA 和 WebSocket 行为没有回归。
-- 重启后 KV 可恢复，聊天室活跃连接按设计丢失。
-- 每次请求能通过 trace id 串起 HTTP、JS、timer、storage 和日志阶段。
-- trace writer 或 RocksDB 变慢时队列保持有界，并产生可见压力指标。
-- 优化报告能说明性能变化来自哪里，而不只给一个更大的 QPS 数字。
+<details class="code-accordion" data-code="ch06/test/trace-test.c++">
+<summary>完整文件 · ch06/test/trace-test.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+```bash
+"$CMAKE" --build "$BUILD"
+"$CMAKE" --build "$BUILD" --target test
+```
+
+<div class="test-result"><strong>步骤测试 6.6 · 七个 case 全部通过</strong><dl>
+<dt>预期输出</dt><dd><code>100% tests passed, 0 tests failed out of 1</code>。其中一个 CTest 可执行文件内部运行 7 个 KJ case。</dd>
+<dt>原因</dt><dd>Trace 的关系、时钟、RAII、容量、序列化，以及 WriteBatch 的阈值和重启恢复都已经被真实文件与真实 RocksDB 覆盖。</dd>
+</dl></div>
+
+本章的优化闭环是：先用 span 区分排队和写入耗时，再观察有界队列的 dropped，最后减少可计数的 RocksDB 写调用。吞吐数字只是证据的一部分；数据正确、内存有界、持久性不退化，优化才成立。
 
 <nav class="pager"><a href="../ch05/">← 第 5 章</a><a href="../reference/">模块参考 →</a></nav>

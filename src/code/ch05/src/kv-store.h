@@ -13,6 +13,14 @@ struct ListResult {
   bool complete;
 };
 
+struct WriteOperation {
+  enum class Type { PUT, DELETE };
+  Type type;
+  std::string nameSpace;
+  std::string key;
+  std::string value;
+};
+
 std::string encodeKey(kj::StringPtr nameSpace, kj::StringPtr key);
 
 class KvStore final {
@@ -24,6 +32,8 @@ class KvStore final {
   void put(kj::StringPtr nameSpace, kj::StringPtr key, kj::StringPtr value,
            bool sync = false);
   void erase(kj::StringPtr nameSpace, kj::StringPtr key, bool sync = false);
+  void writeBatch(const std::vector<WriteOperation>& operations,
+                  bool sync = false);
   ListResult list(kj::StringPtr nameSpace, kj::StringPtr prefix, uint32_t limit);
 
  private:

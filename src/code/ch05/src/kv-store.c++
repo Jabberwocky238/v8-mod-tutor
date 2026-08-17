@@ -2,6 +2,7 @@
 
 #include <kj/debug.h>
 #include <rocksdb/options.h>
+#include <rocksdb/write_batch.h>
 
 namespace {
 
@@ -54,6 +55,26 @@ void KvStore::erase(kj::StringPtr nameSpace, kj::StringPtr key, bool sync) {
   rocksdb::WriteOptions options;
   options.sync = sync;
   requireOk(db->Delete(options, encodeKey(nameSpace, key)), "delete");
+}
+
+void KvStore::writeBatch(const std::vector<WriteOperation>& operations,
+                         bool sync) {
+  rocksdb::WriteBatch batch;
+  for (const auto& operation : operations) {
+    auto key = encodeKey(
+        kj::StringPtr(operation.nameSpace.data(), operation.nameSpace.size()),
+        kj::StringPtr(operation.key.data(), operation.key.size()));
+    if (operation.type == WriteOperation::Type::PUT) {
+      KJ_REQUIRE(operation.value.size() <= 1024 * 1024,
+                 "value exceeds 1 MiB");
+      batch.Put(key, operation.value);
+    } else {
+      batch.Delete(key);
+    }
+  }
+  rocksdb::WriteOptions options;
+  options.sync = sync;
+  requireOk(db->Write(options, &batch), "write batch");
 }
 
 ListResult KvStore::list(kj::StringPtr nameSpace, kj::StringPtr prefix,
