@@ -1,9 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 
 #include <kj/async.h>
-#include <kj/map.h>
 #include <kj/timer.h>
 #include <v8-function.h>
 #include <v8-persistent-handle.h>
@@ -17,19 +17,16 @@ class TimerQueue final : private kj::TaskSet::ErrorHandler {
 
   uint64_t schedule(v8::Local<v8::Function> callback, uint64_t delayMs);
   void cancel(uint64_t id);
+  void clear() { active.clear(); }
   size_t size() const { return active.size(); }
 
  private:
-  struct Entry {
-    v8::TracedReference<v8::Function> callback;
-    kj::Own<kj::PromiseFulfiller<void>> canceler;
-  };
-
+  void fire(uint64_t id);
   void taskFailed(kj::Exception&& error) override;
 
   Runtime& runtime;
   kj::Timer& timer;
   kj::TaskSet tasks;
-  kj::HashMap<uint64_t, Entry> active;
+  std::unordered_map<uint64_t, v8::Global<v8::Function>> active;
   uint64_t nextId = 1;
 };

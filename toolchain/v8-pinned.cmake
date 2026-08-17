@@ -43,6 +43,7 @@ set(CMAKE_CXX_FLAGS_INIT "${PINNED_CXX_INCLUDES}")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld -nostdlib++")
 set(CMAKE_CXX_STANDARD_LIBRARIES_INIT
   "${V8_PREBUILT_ARCHIVE} -lpthread -ldl -lm")
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "" FORCE)
 
 # Never search the host for tutorial dependencies.
 set(CMAKE_FIND_ROOT_PATH "${LAB_ROOT}/.deps")

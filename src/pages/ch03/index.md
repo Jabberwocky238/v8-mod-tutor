@@ -1,193 +1,183 @@
 ---
 title: 第 3 章 · Fetch Handler、定时器与 ExecutionContext
-description: 用 KJ HTTP 服务调用 JavaScript fetch handler，并实现 setTimeout 与 waitUntil 生命周期
+description: 用纯 C++、V8 和 KJ 实现最小 Fetch API，并让响应强制等待三秒
 ---
 
 <p class="chapter-no">CHAPTER 03 · Fetch Runtime</p>
 
-# 从 Hello World 到 Fetch Handler
+# 从求值器到 Fetch Handler
 
-<p class="lead">这一章把短命的命令行程序改造成 HTTP 服务。请求进入 C++，转换为 JS Request，调用导出的 <code>fetch(request, env, ctx)</code>，等待结果后再写回 KJ Response。</p>
+<p class="lead">上一章只能执行一段表达式。本章把它推进成可访问的 HTTP 服务：C++ 创建 Request，调用 JavaScript <code>worker.fetch(request, env, ctx)</code>，等待返回的 Promise，最后把 Response 写回客户端。</p>
 
-> **本章新增：`Runtime`。** 它长期拥有 Isolate、Context、编译后的 handler 和 cppgc heap。KJ 网络事件与 V8 共用一个线程，任何回调进入 JS 前都经过 `Runtime::enter()`。
+> **本章新增：`Runtime`。** 它在第二章 Engine 的基础上长期持有 Isolate、Context、worker 和 CppHeap，并负责每一次 C++ → JavaScript 调用的 HandleScope、ContextScope、异常边界和微任务检查点。
 
-> **本章新增：`Request` / `Response`。** 它们是最小 Web API，只实现 method、url、headers、text body、status 和响应 headers。env、中间件和存储故意留空。
+> **本章新增：最小 Fetch API。** Request 暂时只有 `method`、`url`；Response 支持 body 和 status；env 传入空对象。本章不做中间件和存储，因为它们与理解一次请求的异步生命周期无关。
 
-> **本章新增：`TimerQueue`。** `setTimeout()` 将 JS 回调保存为 `v8::TracedReference<v8::Function>`，再用 `kj::Timer::afterDelay()` 唤醒。定时器触发后重新进入 Context、调用函数并执行微任务检查点。
+> **本章新增：`setTimeout` 与 `ExecutionContext`。** `setTimeout` 让 handler 真正异步等待；`ctx.waitUntil(promise)` 登记响应后的后台工作，但不会把它错误地拼进响应 Promise。
 
-> **本章新增：`ExecutionContext`。** `ctx.waitUntil(promise)` 收集响应后的任务。它不延迟 fetch 响应；只有 handler 自己 `await` 的 Promise 才会推迟响应。
+## 1. 先建立第三章工程
 
-## 1. 本章文件
+第三章是独立可编译工程，不覆盖第二章。目标分为运行时静态库、HTTP 程序和单元测试程序。
 
-```text
-runtime/src/
-├── main.c++                 启动 KJ 网络与 HTTP server
-├── runtime.{h,c++}          Isolate、Context、模块与微任务
-├── bindings/
-│   ├── request.{h,c++}
-│   ├── response.{h,c++}
-│   ├── execution-context.{h,c++}
-│   └── timers.{h,c++}
-└── http-service.{h,c++}     KJ HTTP ↔ JS fetch
-runtime/worker/index.js
-```
-
-完整职责和所有权关系见[请求生命周期参考](../reference/request-lifecycle/)。
-
-本章所有步骤测试集中在一个独立文件。展开后可查看或复制完整内容：
-
-<details class="code-accordion" data-code="ch03/test/fetch-runtime-test.c++">
-<summary>完整测试 · ch03/test/fetch-runtime-test.c++</summary>
+<details class="code-accordion" data-code="ch03/CMakeLists.txt">
+<summary>完整文件 · ch03/CMakeLists.txt</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-## 2. 给 Isolate 接上 cppgc
+```bash
+export LAB_ROOT=/home/zq/v8v8
+CMAKE="$LAB_ROOT/.deps/cmake-3.31.8/bin/cmake"
+SOURCE="$LAB_ROOT/v8-mod-tutor/src/code/ch03"
+BUILD="$SOURCE/build-v137"
 
-第 2 章的 `CreateParams` 改为：
-
-```cpp
-auto cppHeap = v8::CppHeap::Create(
-    platform.get(), v8::CppHeapCreateParams({}));
-
-v8::Isolate::CreateParams params;
-params.array_buffer_allocator =
-    v8::ArrayBuffer::Allocator::NewDefaultAllocator();
-params.cpp_heap = cppHeap.release();
-isolate = v8::Isolate::New(params);
+"$CMAKE" -S "$SOURCE" -B "$BUILD" -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE="$LAB_ROOT/v8-mod-tutor/toolchain/v8-pinned.cmake" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$LAB_ROOT/.deps/v137"
+"$CMAKE" --build "$BUILD"
 ```
 
-JS 可见对象继承 `v8::Object::Wrappable`：
-
-```cpp
-class Request final : public v8::Object::Wrappable {
- public:
-  Request(kj::String method, kj::String url)
-      : method(kj::mv(method)), url(kj::mv(url)) {}
-
-  void Trace(cppgc::Visitor* visitor) const override {
-    v8::Object::Wrappable::Trace(visitor);
-  }
-
-  kj::String method;
-  kj::String url;
-};
-```
-
-使用 `cppgc::MakeGarbageCollected<Request>()` 分配，并用 `v8::Object::Wrap()` 绑定到 JS wrapper。这样 JS wrapper 可达时 C++ 对象也可达，不再手写 weak callback 删除对象。
-
-<div class="test-result"><strong>步骤测试 3.1 · cppgc wrapper</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R fetch-runtime</code></dd>
-<dt>预期输出</dt><dd>case 显示 <code>PASS</code>，进程退出码为 0。</dd>
-<dt>原因</dt><dd>JS wrapper 存在时统一 heap 能追踪 Request；移除 wrapper 并 GC 后 weak probe 才失效。</dd>
+<div class="test-result"><strong>步骤测试 3.1 · 构建三个目标</strong><dl>
+<dt>预期输出</dt><dd>首次构建最后依次出现 <code>libfetch_runtime.a</code>、<code>fetch-runtime-test</code> 和 <code>v8-fetch</code> 的 Linking 行。</dd>
+<dt>原因</dt><dd>这证明 Runtime 同时能被测试程序和真实 HTTP 程序复用，V8、CppGC、KJ async 与 KJ HTTP 均已完成链接。</dd>
 </dl></div>
 
-## 3. 定义 Worker 接口
+## 2. 把 CppHeap 接入 Isolate
 
-<details class="code-accordion" data-code="ch03/worker/index.js">
-<summary>完整文件 · ch03/worker/index.js</summary>
+`Runtime` 不再每个对象临时初始化 V8。Platform 是进程级单例，多个测试 fixture 各自创建 Isolate；每个 Isolate 又连接自己的 CppHeap。Platform 只在进程退出时释放，因为 V8 不允许 Dispose 后在同一进程重新初始化。
+
+<details class="code-accordion" data-code="ch03/src/runtime.h">
+<summary>完整文件 · ch03/src/runtime.h</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-这里有两个时钟：3 秒 Promise 被 `await`，客户端必须等待；250ms Promise 交给 `waitUntil()`，响应发出后继续运行。
+<details class="code-accordion" data-code="ch03/src/runtime.c++">
+<summary>完整文件 · ch03/src/runtime.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-## 4. 实现 setTimeout
+<div class="test-result"><strong>步骤测试 3.2 · 进程与 Isolate 生命周期</strong><dl>
+<dt>运行</dt><dd><code>"$BUILD/fetch-runtime-test"</code></dd>
+<dt>预期输出</dt><dd>六个 case 连续运行，不出现 <code>kPlatformDisposed</code> 或 HandleScope fatal error。</dd>
+<dt>原因</dt><dd>每个 fixture 都销毁自己的 Context、Isolate 和 CppHeap，但共享尚未释放的进程 Platform；异步回调也只在建立 HandleScope 后解引用 Global handle。</dd>
+</dl></div>
 
-绑定回调先检查参数，再创建可取消任务。完整接口定义：
+## 3. 实现可取消的 setTimeout
+
+TimerQueue 给每个回调分配数字 id，用 `v8::Global&lt;Function&gt;` 保持回调可达，再把 KJ timer Promise 放入 TaskSet。到期时先从表中移出回调，再进入 Runtime 调用；`clearTimeout(id)` 只需提前移除它。
 
 <details class="code-accordion" data-code="ch03/src/timer-queue.h">
 <summary>完整文件 · ch03/src/timer-queue.h</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-实际代码不要对脚本调用使用 `ToLocalChecked()`；用 `TryCatch` 将异常交给当前请求。上面片段只突出所有权：`TracedReference` 必须活到 KJ timer 完成，timer 取消时它也要释放。
+<details class="code-accordion" data-code="ch03/src/timer-queue.c++">
+<summary>完整文件 · ch03/src/timer-queue.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-> **线程规则。** `kj::Timer` 的 continuation 在本事件循环线程运行，因此可以重新进入 isolate。以后 RocksDB 使用工作线程时，只能把纯 C++ 数据传回 KJ 线程，绝不能把 `v8::Local` 或 `v8::Global` 送进线程池。
-
-<div class="test-result"><strong>步骤测试 3.2 · setTimeout 与取消</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R fetch-runtime</code></dd>
-<dt>预期输出</dt><dd>2 个 case 均 <code>PASS</code>。</dd>
-<dt>原因</dt><dd>fake timer 前进到 29ms 时 Promise 仍 pending，第 30ms 才 resolve；已 clear 的回调不会运行且 active count 回到 0。</dd>
+<div class="test-result"><strong>步骤测试 3.3 · 到期与取消</strong><dl>
+<dt>预期输出</dt><dd>到期、取消和“带 pending timer 退出”三个 case 都显示 <code>[PASS]</code>。</dd>
+<dt>原因</dt><dd>虚拟时钟推进到 29ms 时 active timer 仍为 1；第 30ms 回调执行并归零。取消测试证明被移除的 Global 没有被调用；退出测试证明剩余 Global 会在 Isolate 销毁前清空。</dd>
 </dl></div>
 
-## 5. 等待 JavaScript Promise
+## 4. 模拟 Fetch API
 
-调用 handler 后可能得到普通 Response，也可能得到 Promise。`Runtime::awaitJs()` 将 Promise 的完成状态与 `kj::Promise` 桥接：
+加载的脚本把 handler 放到 `globalThis.worker`。这避免提前引入 ES module loader，把注意力留在请求生命周期；第四章仍沿用这一约定。
 
-```text
-调用 fetch
-   ↓
-返回 Response ───────────────→ 写 HTTP 响应
-   │
-   └─ 返回 Promise → KJ loop 等待 timer/I/O
-                         ↓
-                  microtask checkpoint
-                         ↓
-                  fulfilled Response → 写 HTTP 响应
-```
+<details class="code-accordion" data-code="ch03/worker/index.js">
+<summary>完整文件 · ch03/worker/index.js</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-桥接器给 JS Promise 安装 fulfill/reject 回调，回调只完成一个 `kj::PromiseFulfiller<v8::Global<v8::Value>>`。每次 KJ 事件进入 JS 后都执行 `PerformMicrotaskCheckpoint()`，否则 `async fetch()` 会停在已完成但未消费的 Promise 上。
+Runtime 为每个请求创建三个参数：带 method/url 的 Request 对象、空 env 对象、带 `waitUntil()` 的 ExecutionContext 对象。Response 构造器生成普通 JavaScript 对象；这已经足以教学和测试状态、正文及异步返回，不假装实现完整浏览器标准。
 
-<div class="test-result"><strong>步骤测试 3.3 · Fetch Promise 桥接</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R fetch-runtime</code></dd>
-<dt>预期输出</dt><dd>2999ms 检查仍 pending，推进到 3000ms 后得到 <code>200 / ready</code>，case 为 <code>PASS</code>。</dd>
-<dt>原因</dt><dd>KJ timer 到期后调用 resolve，microtask checkpoint 恢复 async fetch，最终 Response 才进入 HTTP 层。</dd>
+`dispatch()` 遇到同步 Response 就立即读取；遇到 Promise 则每个虚拟毫秒检查一次状态。定时器回调执行后，显式的 `PerformMicrotaskCheckpoint()` 会恢复 `async fetch()`。
+
+<div class="test-result"><strong>步骤测试 3.4 · 强制等待三秒</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] ... fetch response waits three seconds</code>。</dd>
+<dt>原因</dt><dd>时钟停在 2999ms 时 response Promise 的 <code>poll()</code> 为 false；推进到 3000ms 后返回 <code>200 / ready</code>。测试使用虚拟时间，所以不需要真的等待三秒。</dd>
 </dl></div>
 
-## 6. ExecutionContext 的结束规则
+## 5. ExecutionContext 不阻塞响应
 
-`ExecutionContext` 保存请求级 `kj::TaskSet`：
+`ctx.waitUntil(promise)` 给 Promise 同时安装 fulfill/reject 回调，并增加后台任务计数。它不改变 fetch 返回的 Promise；后台 Promise settle 后计数才减一。
 
 <details class="code-accordion" data-code="ch03/src/execution-context.h">
 <summary>完整文件 · ch03/src/execution-context.h</summary>
 <div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
 </details>
 
-HTTP 响应写完后，服务将 `ctx->drain()` 放进进程级后台 `TaskSet`，最长等待 30 秒。请求对象在这些任务结束前保持可达；超时后取消余下任务并写错误日志。
+<details class="code-accordion" data-code="ch03/src/execution-context.c++">
+<summary>完整文件 · ch03/src/execution-context.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-<div class="test-result"><strong>步骤测试 3.4 · waitUntil</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R fetch-runtime</code></dd>
-<dt>预期输出</dt><dd>响应体立即是 <code>sent</code>，后台任务数先为 1，推进 250ms 后为 0。</dd>
-<dt>原因</dt><dd>waitUntil Promise 进入后台 TaskSet，没有被加入 response Promise；完成后 TaskSet 自动移除它。</dd>
+<div class="test-result"><strong>步骤测试 3.5 · waitUntil 生命周期</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] ... waitUntil outlives the response</code>。</dd>
+<dt>原因</dt><dd>响应正文 <code>sent</code> 已经可读时后台计数仍为 1；虚拟时钟再推进 250ms 后计数变成 0，因此后台工作属于请求上下文，但没有拖延响应。</dd>
 </dl></div>
 
-## 7. KJ HTTP 入口
+## 6. 把 Runtime 接到 KJ HTTP
 
-`FetchService` 实现 `kj::HttpService`：
+FetchService 只做协议适配：将 KJ method/url 交给 Runtime，收到 FetchResponse 后设置 Content-Type、Content-Length 并写 body。JavaScript 细节不会泄漏到网络层。
 
-```cpp
-kj::Promise<void> request(kj::HttpMethod method,
-                          kj::StringPtr url,
-                          const kj::HttpHeaders& headers,
-                          kj::AsyncInputStream& body,
-                          Response& response) override;
-```
+<details class="code-accordion" data-code="ch03/src/fetch-service.h">
+<summary>完整文件 · ch03/src/fetch-service.h</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-处理顺序固定：限制 body 大小 → 创建 cppgc Request/ExecutionContext → 调用 handler → 等待 Response → `response.send()` → 后台 drain waitUntil。
+<details class="code-accordion" data-code="ch03/src/fetch-service.c++">
+<summary>完整文件 · ch03/src/fetch-service.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
-<div class="test-result"><strong>步骤测试 3.5 · 错误隔离</strong><dl>
-<dt>运行</dt><dd><code>ctest --test-dir runtime/build -V -R fetch-runtime</code></dd>
-<dt>预期输出</dt><dd>第一个请求状态 500；重新加载正常 handler 后第二个请求返回 <code>ok</code>，case 为 <code>PASS</code>。</dd>
-<dt>原因</dt><dd>TryCatch 将异常限制在当前请求，没有终止 Isolate 或 KJ event loop。</dd>
+<details class="code-accordion" data-code="ch03/src/main.c++">
+<summary>完整文件 · ch03/src/main.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
+
+异常测试先让 fetch 抛出 `Error('boom')`，随后在同一个 Isolate 中加载正常 handler。
+
+<div class="test-result"><strong>步骤测试 3.6 · 请求错误隔离</strong><dl>
+<dt>预期输出</dt><dd><code>[PASS] ... a thrown fetch does not poison the isolate</code>，最终汇总 <code>6 test(s) passed</code>。</dd>
+<dt>原因</dt><dd>TryCatch 将异常转换为当前 dispatch 的 KJ exception；重新加载 handler 后仍返回 <code>ok</code>，说明进程级 V8 状态没有被一次坏请求破坏。</dd>
 </dl></div>
 
-## 8. 构建与验收
+完整测试文件如下。它使用 `kj::TimerImpl`，因此 30ms、250ms 和 3000ms 都是可精确推进的虚拟时间。
+
+<details class="code-accordion" data-code="ch03/test/fetch-runtime-test.c++">
+<summary>完整文件 · ch03/test/fetch-runtime-test.c++</summary>
+<div class="code-shell"><button class="copy-code" type="button" aria-label="复制完整代码"></button><pre><code>正在加载源码...</code></pre></div>
+</details>
 
 ```bash
-cmake --build runtime/build
-./runtime/build/v8lab --script runtime/worker/index.js --listen 127.0.0.1:8080
+"$BUILD/fetch-runtime-test"
+"$LAB_ROOT/.deps/cmake-3.31.8/bin/ctest" \
+  --test-dir "$BUILD" --output-on-failure
 ```
 
-另一个终端：
+## 7. 真实端口验收
+
+启动服务：
 
 ```bash
-curl -i -w '\nstarttransfer=%{time_starttransfer}s\n' http://127.0.0.1:8080/
+"$BUILD/v8-fetch" "$SOURCE/worker/index.js" 127.0.0.1:8080
 ```
 
-验收结果：
+另一个终端请求 `/demo`：
 
-- 首字节时间至少约 3 秒；响应体为 `hello after 3 seconds`。
-- 响应发出约 250ms 后，服务日志出现后台任务信息。
-- handler 抛异常时返回 500，进程不退出。
-- 客户端断开时，请求 Promise 被取消；已登记的 waitUntil 按既定策略继续或超时。
+```bash
+curl --fail --silent --show-error \
+  --write-out '\nstatus=%{http_code} starttransfer=%{time_starttransfer}s\n' \
+  http://127.0.0.1:8080/demo
+```
+
+<div class="test-result"><strong>章节验收 · 真实三秒响应</strong><dl>
+<dt>预期输出</dt><dd>正文为 <code>hello after 3 seconds: /demo</code>，状态为 200，<code>starttransfer</code> 约为 3.00 秒。</dd>
+<dt>原因</dt><dd>真实 KJ timer 在三秒后 resolve，V8 微任务恢复 async fetch，FetchService 此时才调用 <code>response.send()</code>。随后登记的 250ms waitUntil 继续执行，不影响已经发出的响应。</dd>
+</dl></div>
+
+下一章不会推倒这个 Runtime，而是在它上面增加 SPA 分流、WebSocket、内存聊天室和持久日志。
 
 <nav class="pager"><a href="../ch02/">← 第 2 章</a><a href="../ch04/">第 4 章：Chatroom →</a></nav>

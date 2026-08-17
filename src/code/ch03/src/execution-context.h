@@ -1,33 +1,25 @@
 #pragma once
 
-#include <kj/async.h>
-#include <kj/debug.h>
-#include <v8-object.h>
+#include <vector>
+
+#include <v8-function.h>
 #include <v8-persistent-handle.h>
+#include <v8-promise.h>
 
 class Runtime;
 
-class ExecutionContext final : public v8::Object::Wrappable,
-                               private kj::TaskSet::ErrorHandler {
+class ExecutionContext final {
  public:
-  static constexpr auto MAX_LIFETIME = 30 * kj::SECONDS;
-
-  explicit ExecutionContext(Runtime& runtime)
-      : runtime(runtime), tasks(*this) {}
+  explicit ExecutionContext(Runtime& runtime) : runtime(runtime) {}
 
   void waitUntil(v8::Local<v8::Promise> promise);
-  kj::Promise<void> drain();
-  size_t pendingTaskCount() const { return pending.size(); }
-
-  void Trace(cppgc::Visitor* visitor) const override {
-    v8::Object::Wrappable::Trace(visitor);
-    for (auto& promise : pending) visitor->Trace(promise);
-  }
+  size_t pendingTaskCount() const { return pendingTasks; }
+  void clear();
 
  private:
-  void taskFailed(kj::Exception&& error) override;
+  static void settled(const v8::FunctionCallbackInfo<v8::Value>& info);
 
   Runtime& runtime;
-  kj::TaskSet tasks;
-  kj::Vector<v8::TracedReference<v8::Promise>> pending;
+  size_t pendingTasks = 0;
+  std::vector<v8::Global<v8::Promise>> promises;
 };
