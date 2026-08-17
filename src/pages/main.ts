@@ -13,7 +13,7 @@ hljs.registerLanguage("cpp", cpp)
 hljs.registerLanguage("javascript", javascript)
 hljs.registerLanguage("json", json)
 
-const files = import.meta.glob("../code/**/*", {
+const files = import.meta.glob(["../code/**/*", "!../code/**/build-*/**"], {
   eager: true,
   import: "default",
   query: "?raw",

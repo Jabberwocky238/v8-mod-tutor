@@ -3,6 +3,7 @@ dist/
 
 # Native tutorial build and runtime state.
 build/
+build-*/
 cmake-build-*/
 compile_commands.json
 data/
