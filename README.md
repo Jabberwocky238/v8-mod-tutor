@@ -5,8 +5,8 @@
 完整示例源码位于 `src/code/`，Markdown 使用代码手风琴引用这些文件。
 
 ```bash
-npm install
-npm run dev
+bun install --frozen-lockfile
+bun run dev
 ```
 
-生产构建：`npm run build`，输出到 `dist/`。
+生产构建：`bun run build`，输出到 `dist/`。
