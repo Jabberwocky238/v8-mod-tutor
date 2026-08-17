@@ -7,7 +7,30 @@ import css from "highlight.js/lib/languages/css"
 import javascript from "highlight.js/lib/languages/javascript"
 import json from "highlight.js/lib/languages/json"
 import xml from "highlight.js/lib/languages/xml"
-import { Check, Copy, createIcons } from "lucide"
+import { Check, Copy, createIcons, Moon, Settings, Sun } from "lucide"
+
+type Theme = "light" | "dark" | "system"
+
+const themeButtons = document.querySelectorAll<HTMLButtonElement>(
+  ".theme-switcher [data-theme-value]",
+)
+
+const setTheme = (theme: Theme) => {
+  document.documentElement.dataset.theme = theme
+  localStorage.setItem("v8-mod-theme", theme)
+  for (const button of themeButtons) {
+    const selected = button.dataset.themeValue === theme
+    button.setAttribute("aria-pressed", String(selected))
+  }
+}
+
+for (const button of themeButtons) {
+  button.addEventListener("click", () => setTheme(button.dataset.themeValue as Theme))
+}
+
+const initialTheme = document.documentElement.dataset.theme as Theme | undefined
+setTheme(initialTheme ?? "system")
+createIcons({ icons: { Moon, Settings, Sun } })
 
 hljs.registerLanguage("bash", bash)
 hljs.registerLanguage("cmake", cmake)
@@ -57,7 +80,7 @@ for (const details of document.querySelectorAll<HTMLDetailsElement>(
   const setCopyState = (copied: boolean) => {
     button.innerHTML = `<i data-lucide="${copied ? "check" : "copy"}"></i>`
     button.setAttribute("aria-label", copied ? "已复制" : "复制完整代码")
-    createIcons({ icons: { Check, Copy } })
+    createIcons({ icons: { Check, Copy, Moon, Settings, Sun } })
   }
 
   code.innerHTML = hljs.highlight(source, { language: languageFor(path) }).value

@@ -3,6 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (() => {
+        const saved = localStorage.getItem("v8-mod-theme")
+        document.documentElement.dataset.theme =
+          saved === "light" || saved === "dark" ? saved : "system"
+      })()
+    </script>
   </head>
   <body>
     <header class="site-header">
@@ -16,6 +23,17 @@
         <a href="/ch06/">06 Trace</a>
         <a href="/reference/">参考</a>
       </nav>
+      <div class="theme-switcher" role="group" aria-label="外观模式">
+        <button type="button" data-theme-value="light" aria-label="使用浅色模式" title="浅色模式">
+          <i data-lucide="sun"></i>
+        </button>
+        <button type="button" data-theme-value="dark" aria-label="使用深色模式" title="深色模式">
+          <i data-lucide="moon"></i>
+        </button>
+        <button type="button" data-theme-value="system" aria-label="跟随系统外观" title="跟随系统">
+          <i data-lucide="settings"></i>
+        </button>
+      </div>
     </header>
     <main><article id="main-content"></article></main>
     <footer><span>V8 MOD LAB</span><span>C++ · KJ · cppgc</span></footer>
