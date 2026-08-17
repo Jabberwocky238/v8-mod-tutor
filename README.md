@@ -10,3 +10,11 @@ bun run dev
 ```
 
 生产构建：`bun run build`，输出到 `dist/`。
+
+Cloudflare 静态资源构建校验：
+
+```bash
+bun run cf:build
+```
+
+校验通过后，使用 `bun run cf:deploy` 发布。该命令需要 Cloudflare 登录或 API Token。

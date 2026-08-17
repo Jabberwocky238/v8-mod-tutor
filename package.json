@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "cf:build": "bun run build && wrangler deploy --dry-run",
+    "cf:deploy": "bun run build && wrangler deploy",
     "preview": "vite preview",
     "start": "bun run build && bun run preview"
   },
@@ -23,6 +25,7 @@
     "@types/node": "^24.3.0",
     "prettier": "^3.6.2",
     "typescript": "^5.9.2",
-    "vite": "^7.0.0"
+    "vite": "^7.0.0",
+    "wrangler": "4.123.0"
   }
 }

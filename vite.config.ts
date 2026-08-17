@@ -10,6 +10,7 @@ const SRC_ROOT = resolve(__dirname, "src")
 export default {
   appType: "mpa",
   build: {
+    emptyOutDir: true,
     outDir: OUT_DIR,
     rollupOptions: {
       input: {
