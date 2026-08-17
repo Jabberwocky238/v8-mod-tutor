@@ -4,6 +4,7 @@
 
 int main(int argc, char** argv) {
   Engine engine(argv[0]);
-  std::cout << engine.evaluate("'Hello' + ', World!'") << '\n';
+  auto result = engine.evaluate("'Hello' + ', World!'");
+  std::cout << result.cStr() << '\n';
   return 0;
 }

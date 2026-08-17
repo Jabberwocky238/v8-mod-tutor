@@ -13,6 +13,8 @@ description: 用最小 C++ 宿主执行 JavaScript，并建立后续章节统一
 
 > **本章新增：KJ test runner + CTest。** `KJ_TEST` 定义测试，`KJ_EXPECT` 验证值，`KJ_EXPECT_THROW_MESSAGE` 验证错误；CTest 负责统一发现和运行可执行测试。
 
+> **本章新增：锁定工具链文件。** CMake 通过 `v8-pinned.cmake` 选择第一章安装的 Clang、libc++、Ninja 和 V8 静态归档。后续命令不会根据当前 shell 的 `PATH` 猜测编译器。
+
 ## 1. 建立构建目标
 
 `CMakeLists.txt` 定义三个目标：可复用 `v8lab_engine`、产品程序 `v8lab`、测试程序 `engine-test`。测试通过 `add_test()` 注册给 CTest。
@@ -24,14 +26,21 @@ description: 用最小 C++ 宿主执行 JavaScript，并建立后续章节统一
 
 ```bash
 export LAB_ROOT=/home/zq/v8v8
-cmake -S runtime -B runtime/build -GNinja
-cmake --build runtime/build --target v8lab engine-test
+CMAKE="$LAB_ROOT/.deps/cmake-3.31.8/bin/cmake"
+SOURCE="$LAB_ROOT/v8-mod-tutor/src/code/ch02"
+BUILD="$SOURCE/build-v137"
+
+"$CMAKE" -S "$SOURCE" -B "$BUILD" -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE="$LAB_ROOT/v8-mod-tutor/toolchain/v8-pinned.cmake" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$LAB_ROOT/.deps/v137"
+"$CMAKE" --build "$BUILD" --target v8lab engine-test
 ```
 
 <div class="test-result"><strong>步骤测试 2.1 · 构建目标</strong><dl>
-<dt>运行</dt><dd><code>cmake --build runtime/build --target engine-test</code></dd>
-<dt>预期输出</dt><dd><code>[100%] Built target engine-test</code>，且退出码为 0。</dd>
-<dt>原因</dt><dd>CMake 已找到 V8 monolith、KJ 和 kj-test，并完成链接；此时还没有执行测试。</dd>
+<dt>运行</dt><dd><code>"$CMAKE" --build "$BUILD" --target engine-test</code></dd>
+<dt>预期输出</dt><dd>最后出现 <code>Linking CXX executable engine-test</code>，且退出码为 0。</dd>
+<dt>原因</dt><dd>Ninja 已使用锁定的 Clang 编译 Engine 和测试，并链接预编译 V8、KJ 与 kj-test；此时还没有执行测试。</dd>
 </dl></div>
 
 ## 2. 实现 Engine 生命周期
@@ -51,9 +60,9 @@ cmake --build runtime/build --target v8lab engine-test
 </details>
 
 <div class="test-result"><strong>步骤测试 2.2 · 编译 Engine</strong><dl>
-<dt>运行</dt><dd><code>cmake --build runtime/build --target v8lab_engine</code></dd>
-<dt>预期输出</dt><dd><code>Built target v8lab_engine</code>，没有 undefined reference。</dd>
-<dt>原因</dt><dd>头文件声明与实现一致，V8 编译宏和 monolith 链接参数匹配当前 V8 构建。</dd>
+<dt>运行</dt><dd><code>"$CMAKE" --build "$BUILD" --target v8lab_engine</code></dd>
+<dt>预期输出</dt><dd>首次构建出现 <code>Linking CXX static library libv8lab_engine.a</code>；重复构建显示 <code>ninja: no work to do.</code>。</dd>
+<dt>原因</dt><dd>第一次输出证明 Engine 编译完成；第二种输出表示输入未改变，Ninja 正确复用了结果。静态库阶段不会产生最终 V8 链接。</dd>
 </dl></div>
 
 ## 3. 输出 Hello World
@@ -66,7 +75,7 @@ cmake --build runtime/build --target v8lab engine-test
 </details>
 
 ```bash
-./runtime/build/v8lab
+"$BUILD/v8lab"
 ```
 
 <div class="test-result"><strong>步骤测试 2.3 · Hello World</strong><dl>
@@ -84,12 +93,14 @@ cmake --build runtime/build --target v8lab engine-test
 </details>
 
 ```bash
-ctest --test-dir runtime/build --output-on-failure
+"$BUILD/engine-test"
+"$LAB_ROOT/.deps/cmake-3.31.8/bin/ctest" \
+  --test-dir "$BUILD" --output-on-failure
 ```
 
 <div class="test-result"><strong>步骤测试 2.4 · KJ 测试</strong><dl>
-<dt>预期输出</dt><dd><code>1/1 Test #1: engine ... Passed</code> 和 <code>100% tests passed</code>。</dd>
-<dt>原因</dt><dd>一个测试可执行文件内的两个 `KJ_TEST` 都通过；CTest 按 executable 统计，所以显示 1 个 CTest，而不是 2 个 KJ case。</dd>
+<dt>预期输出</dt><dd>KJ 先分别打印两个 <code>[PASS]</code>，末行是 <code>2 test(s) passed</code>；CTest 随后打印 <code>1/1 Test #1: engine ... Passed</code> 和 <code>100% tests passed</code>。</dd>
+<dt>原因</dt><dd>正常求值和异常转换两个 <code>KJ_TEST</code> 都通过；CTest 按测试可执行文件统计，所以它显示 1 个 CTest，而不是 2 个 KJ case。</dd>
 </dl></div>
 
 ## 5. 以后每一步怎么测
