@@ -3,15 +3,19 @@ import hljs from "highlight.js/lib/core"
 import bash from "highlight.js/lib/languages/bash"
 import cmake from "highlight.js/lib/languages/cmake"
 import cpp from "highlight.js/lib/languages/cpp"
+import css from "highlight.js/lib/languages/css"
 import javascript from "highlight.js/lib/languages/javascript"
 import json from "highlight.js/lib/languages/json"
+import xml from "highlight.js/lib/languages/xml"
 import { Check, Copy, createIcons } from "lucide"
 
 hljs.registerLanguage("bash", bash)
 hljs.registerLanguage("cmake", cmake)
 hljs.registerLanguage("cpp", cpp)
+hljs.registerLanguage("css", css)
 hljs.registerLanguage("javascript", javascript)
 hljs.registerLanguage("json", json)
+hljs.registerLanguage("xml", xml)
 
 const files = import.meta.glob(["../code/**/*", "!../code/**/build-*/**"], {
   eager: true,
@@ -29,6 +33,8 @@ const byName = new Map(
 const languageFor = (path: string): string => {
   if (/CMakeLists\.txt$|\.cmake$/.test(path)) return "cmake"
   if (/\.(c\+\+|cc|cpp|h)$/.test(path)) return "cpp"
+  if (/\.css$/.test(path)) return "css"
+  if (/\.html$/.test(path)) return "xml"
   if (/\.js$/.test(path)) return "javascript"
   if (/\.json$/.test(path)) return "json"
   return "bash"

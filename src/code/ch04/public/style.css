@@ -1,0 +1,10 @@
+:root { font-family: system-ui, sans-serif; color: #202124; background: #f3f5f7; }
+body { margin: 0; }
+main { max-width: 760px; min-height: 100vh; margin: auto; display: grid; grid-template-rows: auto 1fr auto; background: white; }
+header, form { padding: 16px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #d9dde2; }
+header h1 { margin: 0; flex: 1; font-size: 20px; }
+ol { margin: 0; padding: 20px 44px; overflow-y: auto; }
+li { padding: 6px 0; overflow-wrap: anywhere; }
+form { border-top: 1px solid #d9dde2; border-bottom: 0; }
+input { flex: 1; min-width: 0; padding: 10px; }
+button { padding: 10px 18px; }

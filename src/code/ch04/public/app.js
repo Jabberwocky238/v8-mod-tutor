@@ -1,6 +1,7 @@
 const form = document.querySelector("form")
 const input = document.querySelector("input")
 const messages = document.querySelector("ol")
+const status = document.querySelector("output")
 const params = new URLSearchParams(location.search)
 const room = params.get("room") || "lobby"
 const name = params.get("name") || "guest"
@@ -16,9 +17,12 @@ socket.addEventListener("message", (event) => {
   messages.append(item)
 })
 
+socket.addEventListener("open", () => { status.textContent = `${room} · ${name}` })
+socket.addEventListener("close", () => { status.textContent = "连接已关闭" })
+
 form.addEventListener("submit", (event) => {
   event.preventDefault()
   if (socket.readyState !== WebSocket.OPEN || !input.value) return
-  socket.send(JSON.stringify({ type: "message", text: input.value }))
+  socket.send(input.value)
   input.value = ""
 })
